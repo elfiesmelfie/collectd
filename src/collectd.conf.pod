@@ -3467,21 +3467,69 @@ TCP-Port to connect to. Defaults to B<411>.
 
 The C<mcelog plugin> uses mcelog to retrieve machine check exceptions.
 
-By default the plugin connects to B<"/var/run/mcelog-client"> to check if the
-mcelog server is running. When the server is running, the plugin will tail the
-specified logfile to retrieve machine check exception information and send a
-notification with the details from the logfile. The plugin will use the mcelog
-client protocol to retrieve memory related machine check exceptions.
+The plugin is able to get exceptions data from two possible sources.
+First one is mcelog daemon unix socket that provides aggregated stats of memory
+related exceptions. Default socket file handle specified in
+B<McelogClientSocket> is B<"/var/run/mcelog-client">.
+For that data source mcelog plugin submits aggregated errors as values
+as well as related notifications.
+
+Second possible data source that provides more detailed information related
+not only with memory, but also with IO and CPU exceptions is mcelog daemon
+output log file that may be enabled in mcelog configuration. Default path
+is configured in E<lt>B<McelogLogFile>E<gt> as B<"/var/log/mcelog">. This data
+source requires mandatory set of regular expressions that define rules
+for filtering out MCE related messages from source log file, which could be
+a dedicated log file or syslog. Parsed exceptions contain detailed MCE
+information in text format and are submitted as collectd notifications.
+Base set of regular expressions for parsing MCE is provided in B<McelogLogFile>
+markup.
+
+Both data sources can be handled simultaneously. In order to disable any of
+them, corresponding config section should be commented out.
 
 =over 4
 
 =item B<McelogClientSocket> I<Path>
+
 Connect to the mcelog client socket using the UNIX domain socket at I<Path>.
 Defaults to B<"/var/run/mcelog-client">.
 
 =item B<McelogLogfile> I<Path>
 
-The mcelog file to parse. Defaults to B<"/var/log/mcelog">.
+The mcelog file to parse. Defaults to B<"/var/log/mcelog">. It can be any file
+containing message lines matching the regular expression given in
+E<lt>B<Match>E<gt> subsections explained below.
+
+=item E<lt>B<Match>E<gt>
+
+Multiple B<Match> blocks define regular expression patterns for extracting or
+excluding specific string patterns from parsing.
+First and last E<lt>B<Match>E<gt> items set boundaries of multiline
+MCE message and are mandatory.
+
+=item B<Regex> I<regex>
+
+Regular expression with pattern matching string that should be included in MCE
+content. It may contain subexpressions, so next option B<SubmatchIdx> specifies
+which subexpression should be stored as a part of MCE message.
+
+=item B<SubmatchIdx> I<index>
+
+Index of subexpression to be stored as part of MCE message. Multiple
+subexpressions are allowed. Index value 0 takes whole regular expression match
+as a result.
+
+=item B<Excluderegex> I<regex>
+
+Regular expression for excluding lines containing specific matching strings.
+This is processed before checking B<Regex> pattern.
+
+=item B<IsMandatory>  I<true>|I<false>
+
+Flag specifying if message item string described by above parameters is
+mandatory for whole message validation. If set to 1, whole message is discarded
+if it's missing. For 0 it's presence in MCE message is optional.
 
 =back
 

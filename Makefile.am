@@ -1057,8 +1057,12 @@ endif
 
 if BUILD_PLUGIN_MCELOG
 pkglib_LTLIBRARIES += mcelog.la
-mcelog_la_SOURCES = src/mcelog.c
+mcelog_la_SOURCES = src/mcelog.c src/utils_message_parser.c src/utils_message_parser.h \
+                    src/utils_tail_match.c src/utils_tail_match.h \
+                    src/utils_tail.c src/utils_tail.h \
+                    src/utils_match.c src/utils_match.h
 mcelog_la_LDFLAGS = $(PLUGIN_LDFLAGS)
+mcelog_la_LIBADD = liblatency.la
 endif
 
 if BUILD_PLUGIN_MD

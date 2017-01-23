@@ -720,8 +720,40 @@
 #</Plugin>
 
 #<Plugin mcelog>
-#	McelogClientSocket "/var/run/mcelog-client"
-#	McelogLogfile "/var/log/mcelog"
+# McelogClientSocket "/var/run/mcelog-client"
+# <McelogLogfile "/var/log/mcelog">
+#   <Match>
+#     Name "DISCLAIMER"
+#     Regex "(Hardware event.*)"
+#     Excluderegex "kernel"
+#     IsMandatory true
+#   </Match>
+#   <Match>
+#     Name "MCE details"
+#     Regex ".*(MCE|BANK|TSC|RIP|MCEG status|MCA:|MCGSTATUS|MCGCAP|APICID|\
+#               PROCESSOR|TLB|CACHE|UBOX|PCU|QPI|M2M|MemCtrl|SOCKETID|\
+#               Transaction|STATUS|ADDR|MISC|Error enabled|Uncorrected error|\
+#               Machine check not valid|Error overflow|MCi_MISC register valid|\
+#               MCi_ADDR register valid|MCi status|Processor context corrupt|\
+#               Firmware may have updated this error|UCNA|AR|SRAO|SRAR|\
+#               Corrected error|MCG status).*"
+#     SubmatchIdx 0
+#     Excluderegex "kernel"
+#     IsMandatory false
+#   </Match>
+#   <Match>
+#     Name "TIME"
+#     Regex "TIME ([0-9]*)"
+#     Excluderegex "kernel"
+#     IsMandatory false
+#   </Match>
+#   <Match>
+#     Name "CPUID"
+#     Regex "CPUID (Vendor.*)"
+#     Excluderegex "kernel"
+#     IsMandatory true
+#   </Match>
+# </McelogLogfile>
 #</Plugin>
 
 #<Plugin md>

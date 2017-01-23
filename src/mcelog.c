@@ -1,4 +1,4 @@
-/*-
+/*
  * collectd - src/mcelog.c
  * MIT License
  *
@@ -29,25 +29,41 @@
  *   Krzysztof Matczak <krzysztofx.matczak@intel.com>
  */
 
-#include "common.h"
 #include "collectd.h"
+#include "common.h"
+#include "utils_message_parser.h"
 
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <regex.h>
 
 #define MCELOG_PLUGIN "mcelog"
 #define MCELOG_BUFF_SIZE 1024
 #define MCELOG_POLL_TIMEOUT 1000 /* ms */
+
 #define MCELOG_SOCKET_STR "SOCKET"
-#define MCELOG_DIMM_NAME "DMI_NAME"
-#define MCELOG_CORRECTED_ERR "corrected memory errors"
-#define MCELOG_UNCORRECTED_ERR "uncorrected memory errors"
+#define MCELOG_SOCKET_DIMM_NAME "DMI_NAME"
+#define MCELOG_SOCKET_CORR_ERR "corrected memory errors"
+#define MCELOG_SOCKET_UNCORR_ERR "uncorrected memory errors"
+
+#define MCELOG_LOG_CORR_ERR "Corrected error"
+#define MCELOG_LOG_UNCORR_ERR "Uncorrected error"
+#define MCELOG_LOG_TIME "TIME"
+#define MCELOG_LOG_CPU "CPU"
+#define MCELOG_LOG_BANK "BANK"
+#define MCELOG_LOG_SOCKETID "SOCKETID"
+#define MCELOG_LOG_APICID "APICID"
 
 typedef struct mcelog_config_s {
   char logfile[PATH_MAX]; /* mcelog logfile */
   pthread_t tid;          /* poll thread id */
+  message_pattern *msg_patterns;
+  unsigned int msg_patterns_len;
+  _Bool full_read_done;
+  _Bool read_socket;
+  _Bool read_log;
 } mcelog_config_t;
 
 typedef struct socket_adapter_s socket_adapter_t;
@@ -74,19 +90,29 @@ typedef struct mcelog_memory_rec_s {
   char dimm_name[DATA_MAX_NAME_LEN]; /* DMI_NAME "DIMM_F1" */
 } mcelog_memory_rec_t;
 
+typedef struct {
+  char *name;
+  char *regex;
+} pattern_k_v;
+
+static pattern_k_v mce_origin_patterns[] = {
+    {.name = MCELOG_LOG_CPU, .regex = MCELOG_LOG_CPU " ([0-9]*)"},
+    {.name = MCELOG_LOG_BANK, .regex = MCELOG_LOG_BANK " ([0-9]*)"},
+    {.name = MCELOG_LOG_SOCKETID, .regex = MCELOG_LOG_SOCKETID " ([0-9]*)"}};
+
 static int socket_close(socket_adapter_t *self);
 static int socket_write(socket_adapter_t *self, const char *msg,
                         const size_t len);
 static int socket_reinit(socket_adapter_t *self);
 static int socket_receive(socket_adapter_t *self, FILE **p_file);
 
-static mcelog_config_t g_mcelog_config = {.logfile = "/var/log/mcelog"};
+static mcelog_config_t g_mcelog_config = {0};
 
 static socket_adapter_t socket_adapter = {
     .sock_fd = -1,
     .unix_sock =
         {
-            .sun_family = AF_UNIX, .sun_path = "/var/run/mcelog-client",
+            .sun_family = AF_UNIX, .sun_path = "",
         },
     .lock = PTHREAD_RWLOCK_INITIALIZER,
     .close = socket_close,
@@ -96,6 +122,50 @@ static socket_adapter_t socket_adapter = {
 };
 
 static _Bool mcelog_thread_running;
+
+static parser_job_data *parser_job = NULL;
+
+static int mcelog_config_msg_patterns(oconfig_item_t *match_opt, int num) {
+
+  for (unsigned int n = 0; n < num; n++) {
+
+    if (strcasecmp("Match", match_opt[n].key) == 0) {
+      /* set default submatch index to 1 since single submatch is the most
+       * common use case */
+      g_mcelog_config.msg_patterns[n].submatch_idx = 1;
+      for (int i = 0; i < match_opt[n].children_num; i++) {
+        int status = 0;
+        oconfig_item_t *regex_opt = match_opt[n].children + i;
+        if (strcasecmp("Name", regex_opt->key) == 0)
+          status = cf_util_get_string(regex_opt,
+                                      &(g_mcelog_config.msg_patterns[n].name));
+        else if (strcasecmp("Regex", regex_opt->key) == 0)
+          status = cf_util_get_string(regex_opt,
+                                      &(g_mcelog_config.msg_patterns[n].regex));
+        else if (strcasecmp("SubmatchIdx", regex_opt->key) == 0)
+          status = cf_util_get_int(
+              regex_opt, &(g_mcelog_config.msg_patterns[n].submatch_idx));
+        else if (strcasecmp("Excluderegex", regex_opt->key) == 0)
+          status = cf_util_get_string(
+              regex_opt, &(g_mcelog_config.msg_patterns[n].excluderegex));
+        else if (strcasecmp("IsMandatory", regex_opt->key) == 0)
+          status = cf_util_get_boolean(
+              regex_opt, &(g_mcelog_config.msg_patterns[n].is_mandatory));
+
+        if (status != 0) {
+          ERROR(MCELOG_PLUGIN ": Error setting regex option %s",
+                regex_opt->key);
+          return (-1);
+        }
+      }
+    } else {
+      ERROR(MCELOG_PLUGIN ": option `%s' not allowed here.", match_opt[n].key);
+      return (-1);
+    }
+  }
+
+  return (0);
+}
 
 static int mcelog_config(oconfig_item_t *ci) {
   for (int i = 0; i < ci->children_num; i++) {
@@ -108,6 +178,7 @@ static int mcelog_config(oconfig_item_t *ci) {
               child->key);
         return (-1);
       }
+      g_mcelog_config.read_socket = 1;
     } else if (strcasecmp("McelogLogfile", child->key) == 0) {
       if (cf_util_get_string_buffer(child, g_mcelog_config.logfile,
                                     sizeof(g_mcelog_config.logfile)) < 0) {
@@ -115,6 +186,20 @@ static int mcelog_config(oconfig_item_t *ci) {
               child->key);
         return (-1);
       }
+      g_mcelog_config.msg_patterns_len = child->children_num;
+      g_mcelog_config.msg_patterns =
+          calloc(g_mcelog_config.msg_patterns_len,
+                 sizeof(*(g_mcelog_config.msg_patterns)));
+      if (g_mcelog_config.msg_patterns == NULL) {
+        ERROR(MCELOG_PLUGIN ": Error allocating message_patterns");
+        return (-1);
+      }
+      if (mcelog_config_msg_patterns(child->children, child->children_num)) {
+        ERROR(MCELOG_PLUGIN ": Failed to parse 'Match' configuration element");
+        return (-1);
+      }
+
+      g_mcelog_config.read_log = 1;
     } else {
       ERROR(MCELOG_PLUGIN ": Invalid configuration option: \"%s\".",
             child->key);
@@ -212,8 +297,8 @@ static int socket_reinit(socket_adapter_t *self) {
   return (ret);
 }
 
-static int mcelog_prepare_notification(notification_t *n,
-                                       const mcelog_memory_rec_t *mr) {
+static int mcelog_mem_rec_to_notif(notification_t *n,
+                                   const mcelog_memory_rec_t *mr) {
   if (n == NULL || mr == NULL)
     return (-1);
 
@@ -224,13 +309,13 @@ static int mcelog_prepare_notification(notification_t *n,
     return (-1);
   }
   if ((mr->dimm_name[0] != '\0') &&
-      (plugin_notification_meta_add_string(n, MCELOG_DIMM_NAME, mr->dimm_name) <
-       0)) {
+      (plugin_notification_meta_add_string(n, MCELOG_SOCKET_DIMM_NAME,
+                                           mr->dimm_name) < 0)) {
     ERROR(MCELOG_PLUGIN ": add DIMM name meta data failed");
     plugin_notification_meta_free(n->meta);
     return (-1);
   }
-  if (plugin_notification_meta_add_signed_int(n, MCELOG_CORRECTED_ERR,
+  if (plugin_notification_meta_add_signed_int(n, MCELOG_SOCKET_CORR_ERR,
                                               mr->corrected_err_total) < 0) {
     ERROR(MCELOG_PLUGIN ": add corrected errors meta data failed");
     plugin_notification_meta_free(n->meta);
@@ -250,16 +335,16 @@ static int mcelog_prepare_notification(notification_t *n,
     plugin_notification_meta_free(n->meta);
     return (-1);
   }
-  if (plugin_notification_meta_add_signed_int(n, MCELOG_UNCORRECTED_ERR,
+  if (plugin_notification_meta_add_signed_int(n, MCELOG_SOCKET_UNCORR_ERR,
                                               mr->uncorrected_err_total) < 0) {
-    ERROR(MCELOG_PLUGIN ": add corrected errors meta data failed");
+    ERROR(MCELOG_PLUGIN ": add uncorrected errors meta data failed");
     plugin_notification_meta_free(n->meta);
     return (-1);
   }
   if (plugin_notification_meta_add_signed_int(n,
                                               "uncorrected memory timed errors",
                                               mr->uncorrected_err_timed) < 0) {
-    ERROR(MCELOG_PLUGIN ": add corrected timed errors meta data failed");
+    ERROR(MCELOG_PLUGIN ": add uncorrected timed errors meta data failed");
     plugin_notification_meta_free(n->meta);
     return (-1);
   }
@@ -271,7 +356,6 @@ static int mcelog_prepare_notification(notification_t *n,
     plugin_notification_meta_free(n->meta);
     return (-1);
   }
-
   return (0);
 }
 
@@ -334,7 +418,8 @@ static int parse_memory_info(FILE *p_file, mcelog_memory_rec_t *memory_record) {
           memory_record->location[i] = '_';
       DEBUG(MCELOG_PLUGIN ": Got SOCKET INFO %s", memory_record->location);
     }
-    if (!strncmp(buf, MCELOG_DIMM_NAME, strlen(MCELOG_DIMM_NAME))) {
+    if (!strncmp(buf, MCELOG_SOCKET_DIMM_NAME,
+                 strlen(MCELOG_SOCKET_DIMM_NAME))) {
       char *name = NULL;
       char *saveptr = NULL;
       name = strtok_r(buf, "\"", &saveptr);
@@ -347,7 +432,7 @@ static int parse_memory_info(FILE *p_file, mcelog_memory_rec_t *memory_record) {
         }
       }
     }
-    if (!strncmp(buf, MCELOG_CORRECTED_ERR, strlen(MCELOG_CORRECTED_ERR))) {
+    if (!strncmp(buf, MCELOG_SOCKET_CORR_ERR, strlen(MCELOG_SOCKET_CORR_ERR))) {
       /* Get next line*/
       if (fgets(buf, sizeof(buf), p_file) != NULL) {
         sscanf(buf, "\t%d total", &(memory_record->corrected_err_total));
@@ -362,7 +447,8 @@ static int parse_memory_info(FILE *p_file, mcelog_memory_rec_t *memory_record) {
               memory_record->corrected_err_timed_period);
       }
     }
-    if (!strncmp(buf, MCELOG_UNCORRECTED_ERR, strlen(MCELOG_UNCORRECTED_ERR))) {
+    if (!strncmp(buf, MCELOG_SOCKET_UNCORR_ERR,
+                 strlen(MCELOG_SOCKET_UNCORR_ERR))) {
       if (fgets(buf, sizeof(buf), p_file) != NULL) {
         sscanf(buf, "\t%d total", &(memory_record->uncorrected_err_total));
         DEBUG(MCELOG_PLUGIN ": Got uncorrected error total %d",
@@ -400,7 +486,7 @@ static int socket_receive(socket_adapter_t *self, FILE **pp_file) {
   if ((res = poll(&poll_fd, 1, MCELOG_POLL_TIMEOUT)) <= 0) {
     if (res != 0 && errno != EINTR) {
       char errbuf[MCELOG_BUFF_SIZE];
-      ERROR("mcelog: poll failed: %s",
+      ERROR(MCELOG_PLUGIN ": poll failed: %s",
             sstrerror(errno, errbuf, sizeof(errbuf)));
     }
     pthread_rwlock_unlock(&self->lock);
@@ -438,9 +524,9 @@ static int socket_receive(socket_adapter_t *self, FILE **pp_file) {
 static void *poll_worker(__attribute__((unused)) void *arg) {
   char errbuf[MCELOG_BUFF_SIZE];
   mcelog_thread_running = 1;
-  FILE **pp_file = calloc(1, sizeof(*pp_file));
+  FILE **pp_file = calloc(1, sizeof(FILE *));
   if (pp_file == NULL) {
-    ERROR("mcelog: memory allocation failed: %s",
+    ERROR(MCELOG_PLUGIN ": memory allocation failed: %s",
           sstrerror(errno, errbuf, sizeof(errbuf)));
     pthread_exit((void *)1);
   }
@@ -477,9 +563,9 @@ static void *poll_worker(__attribute__((unused)) void *arg) {
                           .time = cdtime(),
                           .message = "Got memory errors info.",
                           .plugin = MCELOG_PLUGIN,
-                          .type_instance = "memory_erros"};
+                          .type_instance = "memory_errors"};
 
-      if (mcelog_prepare_notification(&n, &memory_record) == 0)
+      if (mcelog_mem_rec_to_notif(&n, &memory_record) == 0)
         mcelog_dispatch_notification(&n);
       if (mcelog_submit(&memory_record) != 0)
         ERROR(MCELOG_PLUGIN ": Failed to submit memory errors");
@@ -496,15 +582,26 @@ static void *poll_worker(__attribute__((unused)) void *arg) {
 }
 
 static int mcelog_init(void) {
-  if (socket_adapter.reinit(&socket_adapter) != 0) {
-    ERROR(MCELOG_PLUGIN ": Cannot connect to client socket");
-    return (-1);
+  if (g_mcelog_config.read_log) {
+    parser_job = message_parser_init(
+        g_mcelog_config.logfile, 0, g_mcelog_config.msg_patterns_len - 1,
+        g_mcelog_config.msg_patterns, g_mcelog_config.msg_patterns_len);
+    if (parser_job == NULL) {
+      ERROR(MCELOG_PLUGIN ": Failed to initialize message parser");
+      return (-1);
+    }
   }
-
-  if (plugin_thread_create(&g_mcelog_config.tid, NULL, poll_worker, NULL,
-                           NULL) != 0) {
-    ERROR(MCELOG_PLUGIN ": Error creating poll thread.");
-    return (-1);
+  /* parse memory related aggregated MCE from mcelog socket */
+  if (g_mcelog_config.read_socket) {
+    if (socket_adapter.reinit(&socket_adapter) != 0) {
+      ERROR(MCELOG_PLUGIN ": Cannot connect to client socket");
+      return (-1);
+    }
+    if (plugin_thread_create(&g_mcelog_config.tid, NULL, poll_worker, NULL,
+                             NULL) != 0) {
+      ERROR(MCELOG_PLUGIN ": Error creating poll thread.");
+      return (-1);
+    }
   }
   return (0);
 }
@@ -519,17 +616,108 @@ static int get_memory_machine_checks(void) {
   return (ret);
 }
 
+static int mcelog_message_to_notif(notification_t *n, int max_item_no,
+                                   const message *msg) {
+  if (msg == NULL) {
+    ERROR(MCELOG_PLUGIN ": Invalid message pointer");
+    return (-1);
+  }
+  char *pi = n->plugin_instance;
+  _Bool first_item = 1;
+  for (int j = 0; j < max_item_no; j++) {
+    if (!(msg->message_items[j].value[0]))
+      break;
+    /* set plugin_instance to MCE origin if available */
+    regex_t re;
+    regmatch_t rm[2];
+    for (int i = 0; i < STATIC_ARRAY_SIZE(mce_origin_patterns); i++) {
+      if (regcomp(&re, mce_origin_patterns[i].regex, REG_EXTENDED) != 0) {
+        ERROR(MCELOG_PLUGIN ": Failed to compile regex '%s'",
+              mce_origin_patterns[i].regex);
+        break;
+      }
+      if (regexec(&re, msg->message_items[j].value, 2, rm, 0) == 0) {
+        if (!first_item)
+          *(pi++) = ':';
+        first_item = 0;
+        strncpy(pi, mce_origin_patterns[i].name,
+                strlen(mce_origin_patterns[i].name));
+        pi += strlen(mce_origin_patterns[i].name);
+        *(pi++) = '_';
+        strncpy(pi, msg->message_items[j].value + rm[1].rm_so,
+                rm[1].rm_eo - rm[1].rm_so);
+        pi += rm[1].rm_eo - rm[1].rm_so;
+      }
+      regfree(&re);
+    }
+
+    /* replace collectd timestamp with MCE provided one if available */
+    if (strncmp(msg->message_items[j].name, MCELOG_LOG_TIME,
+                strlen(MCELOG_LOG_TIME)) == 0) {
+      unsigned long tm = strtoull(msg->message_items[j].value, NULL, 0);
+      n->time = MS_TO_CDTIME_T(tm * 1000);
+      continue;
+    }
+    /* decrease severity and set relevant type_instance for corrected errors */
+    if (strncmp(msg->message_items[j].value, MCELOG_LOG_CORR_ERR,
+                strlen(MCELOG_LOG_CORR_ERR)) == 0) {
+      n->severity = NOTIF_WARNING;
+      sstrncpy(n->type_instance, MCELOG_LOG_CORR_ERR, sizeof(n->type_instance));
+    }
+    if (plugin_notification_meta_add_string(n, msg->message_items[j].name,
+                                            msg->message_items[j].value) < 0) {
+      ERROR(MCELOG_PLUGIN ": Failure while adding notification meta data %s:%s",
+            msg->message_items[j].name, msg->message_items[j].value);
+      if (n->meta)
+        plugin_notification_meta_free(n->meta);
+      return (-1);
+    }
+  }
+  return (0);
+}
+
 static int mcelog_read(__attribute__((unused)) user_data_t *ud) {
-  DEBUG(MCELOG_PLUGIN ": %s", __FUNCTION__);
+  if (g_mcelog_config.read_log) {
+    message *messages_storage;
+    if (!g_mcelog_config.full_read_done) {
+      INFO(MCELOG_PLUGIN ": First read of %s. Starting full scan",
+           g_mcelog_config.logfile);
+    }
+    int no_of_mce = message_parser_read(parser_job, &messages_storage,
+                                        !g_mcelog_config.full_read_done);
+    g_mcelog_config.full_read_done = 1;
+    DEBUG(MCELOG_PLUGIN ": No of parsed MCE:%d", no_of_mce);
+    unsigned int max_item_no =
+        STATIC_ARRAY_SIZE(messages_storage[0].message_items);
+    for (int i = 0; i < no_of_mce; i++) {
+      /* dispatching  MCE's only as notifictions */
+      notification_t n = {.severity = NOTIF_FAILURE,
+                          .time = cdtime(),
+                          .message = "Got Machine Check Exception.",
+                          .plugin = MCELOG_PLUGIN,
+                          .type_instance = MCELOG_LOG_UNCORR_ERR};
+      if (mcelog_message_to_notif(&n, max_item_no, &(messages_storage[i])) == 0)
+        mcelog_dispatch_notification(&n);
+    }
+  }
 
-  if (get_memory_machine_checks() != 0)
-    ERROR(MCELOG_PLUGIN ": MACHINE CHECK INFO NOT AVAILABLE");
-
+  if (g_mcelog_config.read_socket) {
+    if (get_memory_machine_checks() != 0)
+      ERROR(MCELOG_PLUGIN ": MACHINE CHECK INFO NOT AVAILABLE");
+  }
   return (0);
 }
 
 static int mcelog_shutdown(void) {
   int ret = 0;
+
+  if (parser_job)
+    message_parser_cleanup(parser_job);
+  parser_job = NULL;
+
+  if (g_mcelog_config.msg_patterns)
+    sfree(g_mcelog_config.msg_patterns);
+
   if (mcelog_thread_running) {
     pthread_cancel(g_mcelog_config.tid);
     if (pthread_join(g_mcelog_config.tid, NULL) != 0) {
