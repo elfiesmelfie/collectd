@@ -34,10 +34,10 @@
 #include "utils_message_parser.h"
 
 #include <poll.h>
+#include <regex.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include <regex.h>
 
 #define MCELOG_PLUGIN "mcelog"
 #define MCELOG_BUFF_SIZE 1024
@@ -55,6 +55,7 @@
 #define MCELOG_LOG_BANK "BANK"
 #define MCELOG_LOG_SOCKETID "SOCKETID"
 #define MCELOG_LOG_APICID "APICID"
+#define MCELOG_LOG_QPI "QPI"
 
 typedef struct mcelog_config_s {
   char logfile[PATH_MAX]; /* mcelog logfile */
@@ -93,12 +94,20 @@ typedef struct mcelog_memory_rec_s {
 typedef struct {
   char *name;
   char *regex;
-} pattern_k_v;
+  _Bool enumerable;
+} mce_origin_pattern;
 
-static pattern_k_v mce_origin_patterns[] = {
-    {.name = MCELOG_LOG_CPU, .regex = MCELOG_LOG_CPU " ([0-9]*)"},
-    {.name = MCELOG_LOG_BANK, .regex = MCELOG_LOG_BANK " ([0-9]*)"},
-    {.name = MCELOG_LOG_SOCKETID, .regex = MCELOG_LOG_SOCKETID " ([0-9]*)"}};
+static mce_origin_pattern mce_origin_patterns[] = {
+    {.name = MCELOG_LOG_CPU,
+     .regex = MCELOG_LOG_CPU " ([0-9]*)",
+     .enumerable = 1},
+    {.name = MCELOG_LOG_BANK,
+     .regex = MCELOG_LOG_BANK " ([0-9]*)",
+     .enumerable = 1},
+    {.name = MCELOG_LOG_SOCKETID,
+     .regex = MCELOG_LOG_SOCKETID " ([0-9]*)",
+     .enumerable = 1},
+    {.name = MCELOG_LOG_QPI, .regex = MCELOG_LOG_QPI, .enumerable = 0}};
 
 static int socket_close(socket_adapter_t *self);
 static int socket_write(socket_adapter_t *self, const char *msg,
@@ -631,6 +640,12 @@ static int mcelog_message_to_notif(notification_t *n, int max_item_no,
     regex_t re;
     regmatch_t rm[2];
     for (int i = 0; i < STATIC_ARRAY_SIZE(mce_origin_patterns); i++) {
+      /* skip if MCE origin already added */
+      if (strstr(n->plugin_instance, mce_origin_patterns[i].name)) {
+        DEBUG(MCELOG_PLUGIN ": Skipping already found MCE origin '%s'",
+              mce_origin_patterns[i].name);
+        continue;
+      }
       if (regcomp(&re, mce_origin_patterns[i].regex, REG_EXTENDED) != 0) {
         ERROR(MCELOG_PLUGIN ": Failed to compile regex '%s'",
               mce_origin_patterns[i].regex);
@@ -643,10 +658,12 @@ static int mcelog_message_to_notif(notification_t *n, int max_item_no,
         strncpy(pi, mce_origin_patterns[i].name,
                 strlen(mce_origin_patterns[i].name));
         pi += strlen(mce_origin_patterns[i].name);
-        *(pi++) = '_';
-        strncpy(pi, msg->message_items[j].value + rm[1].rm_so,
-                rm[1].rm_eo - rm[1].rm_so);
-        pi += rm[1].rm_eo - rm[1].rm_so;
+        if (mce_origin_patterns[i].enumerable) {
+          *(pi++) = '_';
+          strncpy(pi, msg->message_items[j].value + rm[1].rm_so,
+                  rm[1].rm_eo - rm[1].rm_so);
+          pi += rm[1].rm_eo - rm[1].rm_so;
+        }
       }
       regfree(&re);
     }
