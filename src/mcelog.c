@@ -51,11 +51,7 @@
 #define MCELOG_LOG_CORR_ERR "Corrected error"
 #define MCELOG_LOG_UNCORR_ERR "Uncorrected error"
 #define MCELOG_LOG_TIME "TIME"
-#define MCELOG_LOG_CPU "CPU"
-#define MCELOG_LOG_BANK "BANK"
-#define MCELOG_LOG_SOCKETID "SOCKETID"
-#define MCELOG_LOG_APICID "APICID"
-#define MCELOG_LOG_QPI "QPI"
+#define MCELOG_LOG_ORIGIN "ORIGIN"
 
 typedef struct mcelog_config_s {
   char logfile[PATH_MAX]; /* mcelog logfile */
@@ -90,24 +86,6 @@ typedef struct mcelog_memory_rec_s {
   char location[DATA_MAX_NAME_LEN];  /* SOCKET x CHANNEL x DIMM x*/
   char dimm_name[DATA_MAX_NAME_LEN]; /* DMI_NAME "DIMM_F1" */
 } mcelog_memory_rec_t;
-
-typedef struct {
-  char *name;
-  char *regex;
-  _Bool enumerable;
-} mce_origin_pattern;
-
-static mce_origin_pattern mce_origin_patterns[] = {
-    {.name = MCELOG_LOG_CPU,
-     .regex = MCELOG_LOG_CPU " ([0-9]*)",
-     .enumerable = 1},
-    {.name = MCELOG_LOG_BANK,
-     .regex = MCELOG_LOG_BANK " ([0-9]*)",
-     .enumerable = 1},
-    {.name = MCELOG_LOG_SOCKETID,
-     .regex = MCELOG_LOG_SOCKETID " ([0-9]*)",
-     .enumerable = 1},
-    {.name = MCELOG_LOG_QPI, .regex = MCELOG_LOG_QPI, .enumerable = 0}};
 
 static int socket_close(socket_adapter_t *self);
 static int socket_write(socket_adapter_t *self, const char *msg,
@@ -625,71 +603,64 @@ static int get_memory_machine_checks(void) {
   return (ret);
 }
 
+static int mcelog_process_msg_item(const message_item *item,
+                                   notification_t *n) {
+  /* set plugin_instance to origin if available */
+  if (strncmp(item->name, MCELOG_LOG_ORIGIN, strlen(MCELOG_LOG_ORIGIN)) == 0) {
+    sstrncpy(n->plugin_instance, item->value, sizeof(n->plugin_instance));
+    char *c;
+    while ((c = strchr(n->plugin_instance, ' ')) != NULL)
+      *c = '_';
+
+    return (0);
+  }
+
+  /* replace collectd timestamp with MCE provided one if available */
+  if (strncmp(item->name, MCELOG_LOG_TIME, strlen(MCELOG_LOG_TIME)) == 0) {
+    unsigned long tm = strtoull(item->value, NULL, 0);
+    n->time = MS_TO_CDTIME_T(tm * 1000);
+    return (0);
+  }
+
+  /* decrease severity and set relevant type_instance for corrected errors */
+  if (strncmp(item->value, MCELOG_LOG_CORR_ERR, strlen(MCELOG_LOG_CORR_ERR)) ==
+      0) {
+    n->severity = NOTIF_WARNING;
+    sstrncpy(n->type_instance, MCELOG_LOG_CORR_ERR, sizeof(n->type_instance));
+  }
+
+  if (plugin_notification_meta_add_string(n, item->name, item->value) < 0) {
+    ERROR(MCELOG_PLUGIN ": Failure while adding notification meta data %s:%s",
+          item->name, item->value);
+    return (-1);
+  }
+
+  return (0);
+}
+
 static int mcelog_message_to_notif(notification_t *n, int max_item_no,
                                    const message *msg) {
   if (msg == NULL) {
     ERROR(MCELOG_PLUGIN ": Invalid message pointer");
     return (-1);
   }
-  char *pi = n->plugin_instance;
-  _Bool first_item = 1;
+
   for (int j = 0; j < max_item_no; j++) {
     if (!(msg->message_items[j].value[0]))
       break;
-    /* set plugin_instance to MCE origin if available */
-    regex_t re;
-    regmatch_t rm[2];
-    for (int i = 0; i < STATIC_ARRAY_SIZE(mce_origin_patterns); i++) {
-      /* skip if MCE origin already added */
-      if (strstr(n->plugin_instance, mce_origin_patterns[i].name)) {
-        DEBUG(MCELOG_PLUGIN ": Skipping already found MCE origin '%s'",
-              mce_origin_patterns[i].name);
-        continue;
-      }
-      if (regcomp(&re, mce_origin_patterns[i].regex, REG_EXTENDED) != 0) {
-        ERROR(MCELOG_PLUGIN ": Failed to compile regex '%s'",
-              mce_origin_patterns[i].regex);
-        break;
-      }
-      if (regexec(&re, msg->message_items[j].value, 2, rm, 0) == 0) {
-        if (!first_item)
-          *(pi++) = ':';
-        first_item = 0;
-        strncpy(pi, mce_origin_patterns[i].name,
-                strlen(mce_origin_patterns[i].name));
-        pi += strlen(mce_origin_patterns[i].name);
-        if (mce_origin_patterns[i].enumerable) {
-          *(pi++) = '_';
-          strncpy(pi, msg->message_items[j].value + rm[1].rm_so,
-                  rm[1].rm_eo - rm[1].rm_so);
-          pi += rm[1].rm_eo - rm[1].rm_so;
-        }
-      }
-      regfree(&re);
-    }
 
-    /* replace collectd timestamp with MCE provided one if available */
-    if (strncmp(msg->message_items[j].name, MCELOG_LOG_TIME,
-                strlen(MCELOG_LOG_TIME)) == 0) {
-      unsigned long tm = strtoull(msg->message_items[j].value, NULL, 0);
-      n->time = MS_TO_CDTIME_T(tm * 1000);
-      continue;
-    }
-    /* decrease severity and set relevant type_instance for corrected errors */
-    if (strncmp(msg->message_items[j].value, MCELOG_LOG_CORR_ERR,
-                strlen(MCELOG_LOG_CORR_ERR)) == 0) {
-      n->severity = NOTIF_WARNING;
-      sstrncpy(n->type_instance, MCELOG_LOG_CORR_ERR, sizeof(n->type_instance));
-    }
-    if (plugin_notification_meta_add_string(n, msg->message_items[j].name,
-                                            msg->message_items[j].value) < 0) {
-      ERROR(MCELOG_PLUGIN ": Failure while adding notification meta data %s:%s",
-            msg->message_items[j].name, msg->message_items[j].value);
+    if (mcelog_process_msg_item(&msg->message_items[j], n) != 0) {
+      ERROR(MCELOG_PLUGIN ": Failed to process message item");
       if (n->meta)
         plugin_notification_meta_free(n->meta);
       return (-1);
     }
   }
+
+  /* Check if MCE origin was found */
+  if (n->plugin_instance[0] == '\0')
+    sstrncpy(n->plugin_instance, "other", sizeof(n->plugin_instance));
+
   return (0);
 }
 

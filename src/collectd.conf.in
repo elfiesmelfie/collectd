@@ -736,6 +736,13 @@
 #     IsMandatory false
 #   </Match>
 #   <Match>
+#     Name "ORIGIN"
+#     Regex "MCA: (.*)[ _][Ee][Rr]{2}"
+#     SubmatchIdx 1
+#     Excluderegex "kernel|Hardware event|TIME|CPUID|No Error"
+#     IsMandatory false
+#   </Match>
+#   <Match>
 #     Name "TIME"
 #     Regex "TIME ([0-9]*)"
 #     Excluderegex "kernel"

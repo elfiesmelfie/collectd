@@ -3475,7 +3475,7 @@ For that data source mcelog plugin submits aggregated errors as values
 as well as related notifications.
 
 Second possible data source that provides more detailed information related
-not only with memory, but also with IO and CPU exceptions is mcelog daemon
+not only to memory, but also to IO and CPU exceptions is mcelog daemon
 output log file that may be enabled in mcelog configuration. Default path
 is configured in E<lt>B<McelogLogFile>E<gt> as B<"/var/log/mcelog">. This data
 source requires mandatory set of regular expressions that define rules
@@ -3507,6 +3507,13 @@ Multiple B<Match> blocks define regular expression patterns for extracting or
 excluding specific string patterns from parsing.
 First and last E<lt>B<Match>E<gt> items set boundaries of multiline
 MCE message and are mandatory.
+
+Special B<Match> block with I<ORIGIN> B<Name> can be added between mandatory
+B<Match> blocks. The purpose of it is to allow a user to select a string from
+multiline MCE message, that will be used as a plugin instance for dispatched
+notifications. This block applies only to single multiline MCE message rule.
+Other notifications' plugin instances will be unaffected. If regular expression
+doesn't match any parsed line, plugin instance will be set to I<other>.
 
 =item B<Regex> I<regex>
 
