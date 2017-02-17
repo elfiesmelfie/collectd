@@ -53,7 +53,7 @@ typedef struct message_item_pattern_t {
 
 typedef struct message_item_t {
   char name[32];
-  char value[64];
+  char value[DATA_MAX_NAME_LEN];
 } message_item;
 
 typedef struct message_t {
