@@ -721,6 +721,7 @@
 
 #<Plugin mcelog>
 # McelogClientSocket "/var/run/mcelog-client"
+# McelogClientSocketEnabled true
 # <McelogLogfile "/var/log/mcelog">
 #   <Match>
 #     Name "DISCLAIMER"
@@ -755,6 +756,7 @@
 #     IsMandatory true
 #   </Match>
 # </McelogLogfile>
+# McelogLogfileEnabled true
 #</Plugin>
 
 #<Plugin md>

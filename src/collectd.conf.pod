@@ -3495,6 +3495,11 @@ them, corresponding config section should be commented out.
 Connect to the mcelog client socket using the UNIX domain socket at I<Path>.
 Defaults to B<"/var/run/mcelog-client">.
 
+=item B<McelogClientSocketEnabled> B<true>|B<false>
+
+Setting to B<true> enables parsing memory MCE related info from mcelog socket.
+Defaults to B<true>.
+
 =item B<McelogLogfile> I<Path>
 
 The mcelog file to parse. Defaults to B<"/var/log/mcelog">. It can be any file
@@ -3537,6 +3542,12 @@ This is processed before checking B<Regex> pattern.
 Flag specifying if message item string described by above parameters is
 mandatory for whole message validation. If set to 1, whole message is discarded
 if it's missing. For 0 it's presence in MCE message is optional.
+
+=item B<McelogLogfileEnabled> B<true>|B<false>
+
+Setting to B<true> enables parsing all MCE related data from log file.
+Defaults to B<true>.
+
 
 =back
 

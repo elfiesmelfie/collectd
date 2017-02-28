@@ -30,6 +30,7 @@
  */
 
 #include "collectd.h"
+
 #include "common.h"
 #include "utils_message_parser.h"
 
@@ -58,6 +59,7 @@ typedef struct mcelog_config_s {
   pthread_t tid;          /* poll thread id */
   message_pattern *msg_patterns;
   unsigned int msg_patterns_len;
+  _Bool default_patterns;
   _Bool full_read_done;
   _Bool read_socket;
   _Bool read_log;
@@ -93,13 +95,44 @@ static int socket_write(socket_adapter_t *self, const char *msg,
 static int socket_reinit(socket_adapter_t *self);
 static int socket_receive(socket_adapter_t *self, FILE **p_file);
 
-static mcelog_config_t g_mcelog_config = {0};
+static message_pattern msg_patterns_default[] = {
+    {.name = "DISCLAIMER",
+     .regex = "(Hardware event.*)",
+     .excluderegex = "kernel",
+     .is_mandatory = 1},
+    {.name = "MCE details",
+     .regex = "(.*)",
+     .submatch_idx = 0,
+     .excluderegex = "kernel|Hardware event|TIME|CPUID",
+     .is_mandatory = 0},
+    {.name = "ORIGIN",
+     .regex = "MCA: (.*)[ _][Ee][Rr]{2}",
+     .submatch_idx = 1,
+     .excluderegex = "kernel|Hardware event|TIME|CPUID|No Error",
+     .is_mandatory = 0},
+    {.name = "TIME",
+     .regex = "TIME ([0-9]*)",
+     .excluderegex = "kernel",
+     .is_mandatory = 0},
+    {.name = "CPUID",
+     .regex = "CPUID (Vendor.*)",
+     .excluderegex = "kernel",
+     .is_mandatory = 1}};
+
+static mcelog_config_t g_mcelog_config = {
+    .logfile = "/var/log/mcelog",
+    .read_socket = 1,
+    .read_log = 1,
+    .msg_patterns = msg_patterns_default,
+    .msg_patterns_len = STATIC_ARRAY_SIZE(msg_patterns_default),
+    .default_patterns = 1,
+    .full_read_done = 0};
 
 static socket_adapter_t socket_adapter = {
     .sock_fd = -1,
     .unix_sock =
         {
-            .sun_family = AF_UNIX, .sun_path = "",
+            .sun_family = AF_UNIX, .sun_path = "/var/run/mcelog-client",
         },
     .lock = PTHREAD_RWLOCK_INITIALIZER,
     .close = socket_close,
@@ -165,7 +198,12 @@ static int mcelog_config(oconfig_item_t *ci) {
               child->key);
         return (-1);
       }
-      g_mcelog_config.read_socket = 1;
+    } else if (strcasecmp("McelogClientSocketEnabled", child->key) == 0) {
+      if (cf_util_get_boolean(child, &g_mcelog_config.read_socket) < 0) {
+        ERROR(MCELOG_PLUGIN ": Invalid configuration option: \"%s\".",
+              child->key);
+        return (-1);
+      }
     } else if (strcasecmp("McelogLogfile", child->key) == 0) {
       if (cf_util_get_string_buffer(child, g_mcelog_config.logfile,
                                     sizeof(g_mcelog_config.logfile)) < 0) {
@@ -173,20 +211,30 @@ static int mcelog_config(oconfig_item_t *ci) {
               child->key);
         return (-1);
       }
-      g_mcelog_config.msg_patterns_len = child->children_num;
-      g_mcelog_config.msg_patterns =
-          calloc(g_mcelog_config.msg_patterns_len,
-                 sizeof(*(g_mcelog_config.msg_patterns)));
-      if (g_mcelog_config.msg_patterns == NULL) {
-        ERROR(MCELOG_PLUGIN ": Error allocating message_patterns");
-        return (-1);
-      }
-      if (mcelog_config_msg_patterns(child->children, child->children_num)) {
-        ERROR(MCELOG_PLUGIN ": Failed to parse 'Match' configuration element");
-        return (-1);
-      }
 
-      g_mcelog_config.read_log = 1;
+      if (child->children_num > 0) {
+        g_mcelog_config.msg_patterns_len = child->children_num;
+        g_mcelog_config.msg_patterns =
+            calloc(g_mcelog_config.msg_patterns_len,
+                   sizeof(*(g_mcelog_config.msg_patterns)));
+        if (g_mcelog_config.msg_patterns == NULL) {
+          ERROR(MCELOG_PLUGIN ": Error allocating message_patterns");
+          return (-1);
+        }
+
+        if (mcelog_config_msg_patterns(child->children, child->children_num)) {
+          ERROR(MCELOG_PLUGIN
+                ": Failed to parse 'Match' configuration element");
+          return (-1);
+        }
+        g_mcelog_config.default_patterns = 0;
+      }
+    } else if (strcasecmp("McelogLogfileEnabled", child->key) == 0) {
+      if (cf_util_get_boolean(child, &g_mcelog_config.read_log) < 0) {
+        ERROR(MCELOG_PLUGIN ": Invalid configuration option: \"%s\".",
+              child->key);
+        return (-1);
+      }
     } else {
       ERROR(MCELOG_PLUGIN ": Invalid configuration option: \"%s\".",
             child->key);
@@ -569,6 +617,12 @@ static void *poll_worker(__attribute__((unused)) void *arg) {
 }
 
 static int mcelog_init(void) {
+  if (!(g_mcelog_config.read_log || g_mcelog_config.read_socket)) {
+    ERROR(MCELOG_PLUGIN ": No MCE source data configured");
+    return (-1);
+  }
+
+  /* parse all MCE from mcelog log file */
   if (g_mcelog_config.read_log) {
     parser_job = message_parser_init(
         g_mcelog_config.logfile, 0, g_mcelog_config.msg_patterns_len - 1,
@@ -577,6 +631,11 @@ static int mcelog_init(void) {
       ERROR(MCELOG_PLUGIN ": Failed to initialize message parser");
       return (-1);
     }
+    char *pattern_msg = g_mcelog_config.default_patterns
+                            ? "with default regex patterns"
+                            : "with user defined regex patterns";
+    INFO(MCELOG_PLUGIN ": Started parsing MCE errors from %s %s",
+         g_mcelog_config.logfile, pattern_msg);
   }
   /* parse memory related aggregated MCE from mcelog socket */
   if (g_mcelog_config.read_socket) {
@@ -589,6 +648,8 @@ static int mcelog_init(void) {
       ERROR(MCELOG_PLUGIN ": Error creating poll thread.");
       return (-1);
     }
+    INFO(MCELOG_PLUGIN ": Started parsing MCE errors from mcelog socket %s",
+         socket_adapter.unix_sock.sun_path);
   }
   return (0);
 }
@@ -703,7 +764,7 @@ static int mcelog_shutdown(void) {
     message_parser_cleanup(parser_job);
   parser_job = NULL;
 
-  if (g_mcelog_config.msg_patterns)
+  if (!g_mcelog_config.default_patterns && g_mcelog_config.msg_patterns)
     sfree(g_mcelog_config.msg_patterns);
 
   if (mcelog_thread_running) {
