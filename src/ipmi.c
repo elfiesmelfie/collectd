@@ -215,10 +215,6 @@ static const char *sensor_get_db_type(ipmi_sensor_t *sensor) {
   static const c_ipmi_db_type_map_t ipmi_db_type_map[] = {
       {IPMI_UNIT_TYPE_WATTS, "power"}, {IPMI_UNIT_TYPE_CFM, "flow"}};
 
-  /* check if this is a percentage */
-  if (ipmi_sensor_get_percentage(sensor))
-    return "percent";
-
   /* find the db type by using sensor base unit type */
   enum ipmi_unit_type_e ipmi_type = ipmi_sensor_get_base_unit(sensor);
   for (int i = 0; i < STATIC_ARRAY_SIZE(ipmi_db_type_map); i++)
@@ -236,9 +232,11 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
   char buffer[DATA_MAX_NAME_LEN] = {0};
   const char *entity_id_string;
   char sensor_name[DATA_MAX_NAME_LEN];
+  char percent_type[DATA_MAX_NAME_LEN];
   char *sensor_name_ptr;
   int sensor_type;
   const char *type;
+  int sensor_value_type = SENSOR_VALUE_TYPE_DISCRETE;
   ipmi_entity_t *ent = ipmi_sensor_get_entity(sensor);
 
   sensor_id = ipmi_sensor_convert_to_id(sensor);
@@ -283,6 +281,11 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
   if (ignorelist_match(ignorelist, sensor_name_ptr) != 0)
     return (0);
 
+  /* check if sensor provide analog or discrete value */
+  if (ipmi_sensor_get_event_reading_type(sensor) ==
+      IPMI_EVENT_READING_TYPE_THRESHOLD)
+    sensor_value_type = SENSOR_VALUE_TYPE_ANALOG;
+
   /* FIXME: Use rate unit or base unit to scale the value */
 
   sensor_type = ipmi_sensor_get_sensor_type(sensor);
@@ -303,11 +306,16 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
     type = "fanspeed";
     break;
 
+  case IPMI_SENSOR_TYPE_MEMORY:
+    type = "memory";
+    break;
+
   default: {
     /* try to get collectd DB type based on sensor base unit type */
-    if ((type = sensor_get_db_type(sensor)) != NULL)
-      break;
-
+    if (sensor_value_type == SENSOR_VALUE_TYPE_ANALOG) {
+      if ((type = sensor_get_db_type(sensor)) != NULL)
+        break;
+    }
     const char *sensor_type_str = ipmi_sensor_get_sensor_type_string(sensor);
     INFO("ipmi plugin: sensor_list_add: Ignore sensor %s, "
          "because I don't know how to handle its type (%#x, %s). "
@@ -316,6 +324,13 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
     return (-1);
   }
   } /* switch (sensor_type) */
+
+  /* if sensor provides the percentage value, add "_percent" suffix to the
+   * sensor collectd type */
+  if (ipmi_sensor_get_percentage(sensor)) {
+    ssnprintf(percent_type, sizeof(percent_type), "%s_percent", type);
+    type = percent_type;
+  }
 
   pthread_mutex_lock(&sensor_list_lock);
 
@@ -348,10 +363,7 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
   sstrncpy(list_item->sensor_name, sensor_name_ptr,
            sizeof(list_item->sensor_name));
   sstrncpy(list_item->sensor_type, type, sizeof(list_item->sensor_type));
-  list_item->sensor_value_type = SENSOR_VALUE_TYPE_DISCRETE;
-  if (ipmi_sensor_get_event_reading_type(sensor) ==
-      IPMI_EVENT_READING_TYPE_THRESHOLD)
-    list_item->sensor_value_type = SENSOR_VALUE_TYPE_ANALOG;
+  list_item->sensor_value_type = sensor_value_type;
 
   pthread_mutex_unlock(&sensor_list_lock);
 
