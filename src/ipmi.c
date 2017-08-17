@@ -46,8 +46,19 @@ struct c_ipmi_sensor_list_s {
   char sensor_name[DATA_MAX_NAME_LEN];
   char sensor_type[DATA_MAX_NAME_LEN];
   int sensor_not_present;
+  int sensor_value_type;
   c_ipmi_sensor_list_t *next;
 };
+
+struct c_ipmi_db_type_map_s {
+  enum ipmi_unit_type_e type;
+  const char *type_name;
+};
+typedef struct c_ipmi_db_type_map_s c_ipmi_db_type_map_t;
+
+/* The sensor value types */
+#define SENSOR_VALUE_TYPE_ANALOG 0
+#define SENSOR_VALUE_TYPE_DISCRETE 1
 
 /*
  * Module global variables
@@ -202,6 +213,19 @@ static void sensor_read_handler(ipmi_sensor_t *sensor, int err,
   plugin_dispatch_values(&vl);
 } /* void sensor_read_handler */
 
+static const char *sensor_get_db_type(ipmi_sensor_t *sensor) {
+  static const c_ipmi_db_type_map_t ipmi_db_type_map[] = {
+      {IPMI_UNIT_TYPE_WATTS, "power"}, {IPMI_UNIT_TYPE_CFM, "flow"}};
+
+  /* find the db type by using sensor base unit type */
+  enum ipmi_unit_type_e ipmi_type = ipmi_sensor_get_base_unit(sensor);
+  for (int i = 0; i < STATIC_ARRAY_SIZE(ipmi_db_type_map); i++)
+    if (ipmi_db_type_map[i].type == ipmi_type)
+      return ipmi_db_type_map[i].type_name;
+
+  return NULL;
+} /* const char* sensor_get_db_type */
+
 static void sensor_get_name(ipmi_sensor_t *sensor, char *buf, int buf_len) {
   char buffer[DATA_MAX_NAME_LEN] = {0};
   ipmi_entity_t *ent = ipmi_sensor_get_entity(sensor);
@@ -256,6 +280,8 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
   c_ipmi_sensor_list_t *list_item;
   c_ipmi_sensor_list_t *list_prev;
 
+  char percent_type[DATA_MAX_NAME_LEN];
+  int sensor_value_type = SENSOR_VALUE_TYPE_DISCRETE;
   char buffer[DATA_MAX_NAME_LEN] = {0};
   char *sensor_name_ptr = buffer;
   int sensor_type;
@@ -267,6 +293,11 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
   /* Both `ignorelist' and `plugin_instance' may be NULL. */
   if (ignorelist_match(ignorelist, sensor_name_ptr) != 0)
     return 0;
+
+  /* check if sensor provide analog or discrete value */
+  if (ipmi_sensor_get_event_reading_type(sensor) ==
+      IPMI_EVENT_READING_TYPE_THRESHOLD)
+    sensor_value_type = SENSOR_VALUE_TYPE_ANALOG;
 
   /* FIXME: Use rate unit or base unit to scale the value */
 
@@ -288,10 +319,17 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
     type = "fanspeed";
     break;
 
-  default: {
-    const char *sensor_type_str;
+  case IPMI_SENSOR_TYPE_MEMORY:
+    type = "memory";
+    break;
 
-    sensor_type_str = ipmi_sensor_get_sensor_type_string(sensor);
+  default: {
+    /* try to get collectd DB type based on sensor base unit type */
+    if (sensor_value_type == SENSOR_VALUE_TYPE_ANALOG) {
+      if ((type = sensor_get_db_type(sensor)) != NULL)
+        break;
+    }
+    const char *sensor_type_str = ipmi_sensor_get_sensor_type_string(sensor);
     INFO("ipmi plugin: sensor_list_add: Ignore sensor %s, "
          "because I don't know how to handle its type (%#x, %s). "
          "If you need this sensor, please file a bug report.",
@@ -299,6 +337,13 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
     return -1;
   }
   } /* switch (sensor_type) */
+
+  /* if sensor provides the percentage value, add "_percent" suffix to the
+   * sensor collectd type */
+  if (ipmi_sensor_get_percentage(sensor)) {
+    snprintf(percent_type, sizeof(percent_type), "%s_percent", type);
+    type = percent_type;
+  }
 
   pthread_mutex_lock(&sensor_list_lock);
 
@@ -331,6 +376,7 @@ static int sensor_list_add(ipmi_sensor_t *sensor) {
   sstrncpy(list_item->sensor_name, sensor_name_ptr,
            sizeof(list_item->sensor_name));
   sstrncpy(list_item->sensor_type, type, sizeof(list_item->sensor_type));
+  list_item->sensor_value_type = sensor_value_type;
 
   pthread_mutex_unlock(&sensor_list_lock);
 
@@ -403,8 +449,12 @@ static int sensor_list_read_all(void) {
 
   for (c_ipmi_sensor_list_t *list_item = sensor_list; list_item != NULL;
        list_item = list_item->next) {
-    ipmi_sensor_id_get_reading(list_item->sensor_id, sensor_read_handler,
-                               /* user data = */ list_item);
+    /* only analog values can be read by ipmi_sensor_id_get_reading() API
+     * so, skip the reading of discrete sensor here. To read discrete
+     * value the ipmi_sensor_get_states () should be used instead */
+    if (list_item->sensor_value_type == SENSOR_VALUE_TYPE_ANALOG)
+      ipmi_sensor_id_get_reading(list_item->sensor_id, sensor_read_handler,
+                                 /* user data = */ list_item);
   } /* for (list_item) */
 
   pthread_mutex_unlock(&sensor_list_lock);
